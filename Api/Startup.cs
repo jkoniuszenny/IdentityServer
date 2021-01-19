@@ -21,6 +21,16 @@ using Api.Extensions;
 using Core.NLog;
 using Infrastructure.IoC;
 using Core.NLog.Interfaces;
+using Microsoft.AspNetCore.Identity;
+using Core.Models.Entities;
+using Microsoft.AspNetCore.Mvc;
+using IdentityServer4.EntityFramework.DbContexts;
+using IdentityServer4.EntityFramework.Mappers;
+using Microsoft.EntityFrameworkCore;
+using System.Reflection;
+using Infrastructure.Extensions;
+using Infrastructure;
+using static Infrastructure.IdentityProvider;
 
 namespace Api
 {
@@ -54,7 +64,34 @@ namespace Api
 
             services.AddControllers();
 
-            services.AddDbContext<DatabaseContext>();
+            services.AddDbContext<DatabaseContext>(ServiceLifetime.Transient);
+
+            services.AddIdentity<AppUser, AppRole> (o =>
+            {
+                o.Password.RequireDigit = false;
+                o.Password.RequireLowercase = false;
+                o.Password.RequireUppercase = false;
+                o.Password.RequireNonAlphanumeric = false;
+                o.Password.RequiredLength = 6;
+              
+            })
+            .AddRoles<AppRole>()
+            .AddEntityFrameworkStores<DatabaseContext>()
+            .AddDefaultTokenProviders();
+
+            var migrationsAssembly = typeof(Startup).GetTypeInfo().Assembly.GetName().Name;
+            services.AddIdentityServer().AddDeveloperSigningCredential()
+                .AddOperationalStore(options =>
+                {
+                    options.ConfigureDbContext = builder => builder.UseSqlServer(Configuration.GetSettings<DatabaseSettings>().ConnectionString, sql => sql.MigrationsAssembly(migrationsAssembly));
+                    options.EnableTokenCleanup = true;
+                    options.TokenCleanupInterval = 30;
+                }).AddConfigurationStore(options =>
+                      options.ConfigureDbContext = builder => builder.UseSqlServer(Configuration.GetSettings<DatabaseSettings>().ConnectionString, sql => sql.MigrationsAssembly(migrationsAssembly))
+                )
+                  .AddAspNetIdentity<AppUser>();
+
+            services.AddAuthentication();
 
             var builder = new ContainerBuilder();
 
@@ -76,6 +113,8 @@ namespace Api
         [Obsolete]
         public void Configure(IApplicationBuilder app, IWebHostEnvironment env, ILoggerFactory loggerFactory)
         {
+            InitializeDatabase(app);
+
             if (env.IsDevelopment())
             {
                 app.UseDeveloperExceptionPage();
@@ -100,7 +139,7 @@ namespace Api
                 .AllowAnyMethod()
                 .AllowAnyHeader());
 
-            app.UseAuthentication();
+            
 
             app.ConfigureExceptionHandler();
 
@@ -112,7 +151,11 @@ namespace Api
             }
             app.UseRouting();
 
-            app.Use(async (context, next) => {
+            app.UseIdentityServer();
+            app.UseAuthorization();
+
+            app.Use(async (context, next) =>
+            {
                 context.Request.EnableBuffering();
                 await next().ConfigureAwait(false);
             });
@@ -121,6 +164,69 @@ namespace Api
             {
                 endpoints.MapControllers();
             });
+        }
+
+        private static void InitializeDatabase(IApplicationBuilder app)
+        {
+            using (var serviceScope = app.ApplicationServices.GetService<IServiceScopeFactory>().CreateScope())
+            {
+                serviceScope.ServiceProvider.GetRequiredService<PersistedGrantDbContext>().Database.Migrate();
+                serviceScope.ServiceProvider.GetRequiredService<ConfigurationDbContext>().Database.Migrate();
+                serviceScope.ServiceProvider.GetRequiredService<DatabaseContext>().Database.Migrate();
+
+                var context = serviceScope.ServiceProvider.GetRequiredService<ConfigurationDbContext>();
+
+                if (!context.Clients.Any())
+                {
+                    foreach (var client in Clients.Get())
+                    {
+                        context.Clients.Add(client.ToEntity());
+                    }
+                    context.SaveChanges();
+                }
+
+                if (!context.IdentityResources.Any())
+                {
+                    foreach (var resource in Resources.GetIdentityResources())
+                    {
+                        context.IdentityResources.Add(resource.ToEntity());
+                    }
+                    context.SaveChanges();
+                }
+
+                if (!context.ApiScopes.Any())
+                {
+                    foreach (var scope in Resources.GetApiScopes())
+                    {
+                        context.ApiScopes.Add(scope.ToEntity());
+                    }
+                    context.SaveChanges();
+                }
+
+                if (!context.ApiResources.Any())
+                {
+                    foreach (var resource in Resources.GetApiResources())
+                    {
+                        context.ApiResources.Add(resource.ToEntity());
+                    }
+                    context.SaveChanges();
+                }
+
+                //var userManager = serviceScope.ServiceProvider.GetRequiredService<UserManager<IdentityUser>>();
+                //if (!userManager.Users.Any())
+                //{
+                //    foreach (var testUser in Users.Get())
+                //    {
+                //        var identityUser = new IdentityUser(testUser.Username)
+                //        {
+                //            Id = testUser.SubjectId
+                //        };
+
+                //        userManager.CreateAsync(identityUser, "Password123!").Wait();
+                //        userManager.AddClaimsAsync(identityUser, testUser.Claims.ToList()).Wait();
+                //    }
+                //}
+            }
         }
     }
 }
